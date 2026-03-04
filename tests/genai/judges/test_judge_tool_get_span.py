@@ -177,6 +177,23 @@ def test_invoke_with_attribute_filter():
     assert "max_tokens" not in parsed["attributes"]
 
 
+def test_invoke_attribute_filtering_preserves_non_attribute_fields():
+    tool = GetSpanTool()
+    span_dict = {
+        "name": "op",
+        "inputs": {"x": 1},
+        "attributes": {"key1": "val1", "key2": "val2"},
+    }
+    trace = _make_trace([_make_mock_span("s1", span_dict)])
+
+    result = tool.invoke(trace, span_id="s1", attributes=["key1"])
+    parsed = json.loads(result.content)
+
+    assert parsed["name"] == "op"
+    assert parsed["inputs"] == {"x": 1}
+    assert parsed["attributes"] == {"key1": "val1"}
+
+
 def test_invoke_with_empty_attribute_filter():
     tool = GetSpanTool()
     span_dict = {
@@ -253,7 +270,6 @@ def test_invoke_small_content_no_pagination():
 
 def test_invoke_large_content_returns_first_chunk():
     tool = GetSpanTool()
-    # Build content that exceeds _MAX_CHUNK_SIZE_BYTES
     large_value = "x" * (_MAX_CHUNK_SIZE_BYTES + 50_000)
     span_dict = {"span_id": "big", "data": large_value}
     span = _make_mock_span("big", span_dict)
@@ -337,7 +353,6 @@ def test_invoke_pagination_last_page_has_no_token():
 def test_invoke_content_exactly_at_chunk_boundary():
     tool = GetSpanTool()
     # Build content whose JSON-encoded size is exactly _MAX_CHUNK_SIZE_BYTES.
-    # json.dumps({"d": "..."}) adds overhead for {"d": ""}  which is 8 bytes.
     overhead = len(json.dumps({"d": ""}).encode("utf-8"))
     filler = "a" * (_MAX_CHUNK_SIZE_BYTES - overhead)
     span_dict = {"d": filler}
@@ -352,3 +367,37 @@ def test_invoke_content_exactly_at_chunk_boundary():
     assert result.page_token is None
     assert result.content_size_bytes == _MAX_CHUNK_SIZE_BYTES
     assert json.loads(result.content) == span_dict
+
+
+def test_invoke_pagination_content_size_bytes_consistent_across_pages():
+    tool = GetSpanTool()
+    large_value = "v" * (_MAX_CHUNK_SIZE_BYTES * 2)
+    span_dict = {"span_id": "big", "data": large_value}
+    span = _make_mock_span("big", span_dict)
+    trace = _make_trace([span])
+
+    full_size = len(json.dumps(span_dict).encode("utf-8"))
+
+    sizes = []
+    token = None
+    while True:
+        result = tool.invoke(trace, span_id="big", page_token=token)
+        sizes.append(result.content_size_bytes)
+        if result.page_token is None:
+            break
+        token = result.page_token
+
+    # content_size_bytes should report the total size on every page
+    assert all(s == full_size for s in sizes)
+
+
+def test_invoke_page_token_is_string():
+    tool = GetSpanTool()
+    large_value = "q" * (_MAX_CHUNK_SIZE_BYTES + 1)
+    span_dict = {"span_id": "big", "data": large_value}
+    span = _make_mock_span("big", span_dict)
+    trace = _make_trace([span])
+
+    result = tool.invoke(trace, span_id="big")
+
+    assert isinstance(result.page_token, str)
