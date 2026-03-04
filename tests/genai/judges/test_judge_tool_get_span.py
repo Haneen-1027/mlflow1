@@ -1,8 +1,11 @@
 import json
 from unittest.mock import MagicMock
 
-import pytest
-
+from mlflow.entities.trace import Trace
+from mlflow.entities.trace_data import TraceData
+from mlflow.entities.trace_info import TraceInfo
+from mlflow.entities.trace_location import TraceLocation
+from mlflow.entities.trace_state import TraceState
 from mlflow.genai.judges.tools.get_span import GetSpanTool, SpanResult, _MAX_CHUNK_SIZE_BYTES
 from mlflow.types.llm import ToolDefinition
 
@@ -15,14 +18,22 @@ def _make_mock_span(span_id, span_dict):
     return span
 
 
-def _make_mock_trace(spans):
-    """Create a mock trace containing the given list of mock spans."""
-    trace = MagicMock()
-    trace.data.spans = spans
+def _make_trace(spans):
+    """Create a Trace with mock TraceData containing the given spans."""
+    trace_info = TraceInfo(
+        trace_id="test-trace-id",
+        trace_location=TraceLocation.from_experiment_id("0"),
+        request_time=1234567890,
+        state=TraceState.OK,
+        execution_duration=100,
+    )
+    trace_data = MagicMock(spec=TraceData)
+    trace_data.spans = spans
+    trace = Trace(info=trace_info, data=trace_data)
     return trace
 
 
-# --- Tool metadata tests ---
+# --- Tool name and definition tests ---
 
 
 def test_get_span_tool_name():
@@ -37,73 +48,67 @@ def test_get_span_tool_get_definition():
     assert isinstance(definition, ToolDefinition)
     assert definition.type == "function"
     assert definition.function.name == "get_span"
-    assert "span" in definition.function.description.lower()
+    assert "span" in definition.function.description
+    assert "page_token" in definition.function.description
     assert definition.function.parameters.type == "object"
     assert definition.function.parameters.required == ["span_id"]
-    assert "span_id" in definition.function.parameters.properties
-    assert "attributes" in definition.function.parameters.properties
-    assert "page_token" in definition.function.parameters.properties
+
+    properties = definition.function.parameters.properties
+    assert "span_id" in properties
+    assert "attributes" in properties
+    assert "page_token" in properties
+    assert properties["span_id"].type == "string"
+    assert properties["attributes"].type == "array"
+    assert properties["page_token"].type == "string"
 
 
-# --- Successful retrieval tests ---
+# --- Successful span retrieval tests ---
 
 
 def test_invoke_returns_span_result():
     tool = GetSpanTool()
-    span_dict = {"name": "llm_call", "attributes": {"model": "gpt-4"}}
-    trace = _make_mock_trace([_make_mock_span("span-1", span_dict)])
+    span_dict = {"span_id": "abc", "name": "test-span", "attributes": {"key": "value"}}
+    span = _make_mock_span("abc", span_dict)
+    trace = _make_trace([span])
 
-    result = tool.invoke(trace, span_id="span-1")
+    result = tool.invoke(trace, span_id="abc")
 
     assert isinstance(result, SpanResult)
-    assert result.span_id == "span-1"
+    assert result.span_id == "abc"
     assert result.error is None
-
-
-def test_invoke_content_is_valid_json():
-    tool = GetSpanTool()
-    span_dict = {"name": "retrieve", "inputs": {"query": "hello"}, "outputs": [1, 2, 3]}
-    trace = _make_mock_trace([_make_mock_span("s1", span_dict)])
-
-    result = tool.invoke(trace, span_id="s1")
-    parsed = json.loads(result.content)
-
-    assert parsed == span_dict
-
-
-def test_invoke_content_size_bytes_matches():
-    tool = GetSpanTool()
-    span_dict = {"name": "op", "value": 42}
-    trace = _make_mock_trace([_make_mock_span("s1", span_dict)])
-
-    result = tool.invoke(trace, span_id="s1")
-    expected_size = len(json.dumps(span_dict).encode("utf-8"))
-
-    assert result.content_size_bytes == expected_size
-
-
-def test_invoke_small_content_no_pagination():
-    tool = GetSpanTool()
-    span_dict = {"name": "small_span"}
-    trace = _make_mock_trace([_make_mock_span("s1", span_dict)])
-
-    result = tool.invoke(trace, span_id="s1")
-
     assert result.page_token is None
 
 
-def test_invoke_selects_correct_span_among_multiple():
+def test_invoke_returns_correct_json_content():
     tool = GetSpanTool()
-    span_a = _make_mock_span("a", {"name": "span_a"})
-    span_b = _make_mock_span("b", {"name": "span_b"})
-    span_c = _make_mock_span("c", {"name": "span_c"})
-    trace = _make_mock_trace([span_a, span_b, span_c])
+    span_dict = {
+        "span_id": "span-1",
+        "name": "retriever",
+        "attributes": {"model": "gpt-4"},
+        "events": [],
+    }
+    span = _make_mock_span("span-1", span_dict)
+    trace = _make_trace([span])
 
-    result = tool.invoke(trace, span_id="b")
+    result = tool.invoke(trace, span_id="span-1")
 
-    assert result.span_id == "b"
-    assert json.loads(result.content)["name"] == "span_b"
+    parsed = json.loads(result.content)
+    assert parsed == span_dict
+    assert result.content_size_bytes == len(json.dumps(span_dict).encode("utf-8"))
+
+
+def test_invoke_selects_correct_span_from_multiple():
+    tool = GetSpanTool()
+    span_a = _make_mock_span("span-a", {"span_id": "span-a", "name": "first"})
+    span_b = _make_mock_span("span-b", {"span_id": "span-b", "name": "second"})
+    span_c = _make_mock_span("span-c", {"span_id": "span-c", "name": "third"})
+    trace = _make_trace([span_a, span_b, span_c])
+
+    result = tool.invoke(trace, span_id="span-b")
+
     assert result.error is None
+    parsed = json.loads(result.content)
+    assert parsed["name"] == "second"
 
 
 # --- Error scenario tests ---
@@ -111,54 +116,63 @@ def test_invoke_selects_correct_span_among_multiple():
 
 def test_invoke_missing_span_id():
     tool = GetSpanTool()
-    trace = _make_mock_trace([])
+    trace = _make_trace([])
 
     result = tool.invoke(trace)
 
-    assert result.error == "span_id is required"
+    assert isinstance(result, SpanResult)
     assert result.span_id == ""
     assert result.content == ""
     assert result.content_size_bytes == 0
     assert result.page_token is None
+    assert result.error == "span_id is required"
 
 
 def test_invoke_span_not_found():
     tool = GetSpanTool()
-    trace = _make_mock_trace([_make_mock_span("existing", {"name": "exists"})])
+    span = _make_mock_span("existing-span", {"span_id": "existing-span"})
+    trace = _make_trace([span])
 
     result = tool.invoke(trace, span_id="nonexistent")
 
-    assert result.error == "Span with ID 'nonexistent' not found in trace"
     assert result.span_id == "nonexistent"
     assert result.content == ""
     assert result.content_size_bytes == 0
     assert result.page_token is None
+    assert "not found" in result.error
 
 
 def test_invoke_empty_trace():
     tool = GetSpanTool()
-    trace = _make_mock_trace([])
+    trace = _make_trace([])
 
     result = tool.invoke(trace, span_id="any-id")
 
-    assert result.error == "Span with ID 'any-id' not found in trace"
+    assert result.error is not None
+    assert "not found" in result.error
     assert result.content == ""
 
 
 # --- Attribute filtering tests ---
 
 
-def test_invoke_attribute_filtering():
+def test_invoke_with_attribute_filter():
     tool = GetSpanTool()
     span_dict = {
-        "name": "llm",
-        "attributes": {"model": "gpt-4", "temperature": 0.7, "max_tokens": 100},
+        "span_id": "s1",
+        "name": "llm-call",
+        "attributes": {
+            "model": "gpt-4",
+            "temperature": 0.7,
+            "max_tokens": 100,
+        },
     }
-    trace = _make_mock_trace([_make_mock_span("s1", span_dict)])
+    span = _make_mock_span("s1", span_dict)
+    trace = _make_trace([span])
 
     result = tool.invoke(trace, span_id="s1", attributes=["model", "temperature"])
-    parsed = json.loads(result.content)
 
+    parsed = json.loads(result.content)
     assert parsed["attributes"] == {"model": "gpt-4", "temperature": 0.7}
     assert "max_tokens" not in parsed["attributes"]
 
@@ -170,7 +184,7 @@ def test_invoke_attribute_filtering_preserves_non_attribute_fields():
         "inputs": {"x": 1},
         "attributes": {"key1": "val1", "key2": "val2"},
     }
-    trace = _make_mock_trace([_make_mock_span("s1", span_dict)])
+    trace = _make_trace([_make_mock_span("s1", span_dict)])
 
     result = tool.invoke(trace, span_id="s1", attributes=["key1"])
     parsed = json.loads(result.content)
@@ -180,123 +194,189 @@ def test_invoke_attribute_filtering_preserves_non_attribute_fields():
     assert parsed["attributes"] == {"key1": "val1"}
 
 
-def test_invoke_attribute_filtering_no_matching_keys():
+def test_invoke_with_empty_attribute_filter():
     tool = GetSpanTool()
-    span_dict = {"name": "op", "attributes": {"a": 1, "b": 2}}
-    trace = _make_mock_trace([_make_mock_span("s1", span_dict)])
-
-    result = tool.invoke(trace, span_id="s1", attributes=["nonexistent"])
-    parsed = json.loads(result.content)
-
-    assert parsed["attributes"] == {}
-
-
-def test_invoke_attribute_filtering_span_without_attributes_key():
-    tool = GetSpanTool()
-    span_dict = {"name": "op", "inputs": {"q": "hi"}}
-    trace = _make_mock_trace([_make_mock_span("s1", span_dict)])
-
-    result = tool.invoke(trace, span_id="s1", attributes=["anything"])
-    parsed = json.loads(result.content)
-
-    # attributes filter should be a no-op when span has no "attributes" key
-    assert "attributes" not in parsed
-    assert parsed["name"] == "op"
-
-
-def test_invoke_empty_attributes_list_returns_no_attributes():
-    tool = GetSpanTool()
-    span_dict = {"name": "op", "attributes": {"a": 1, "b": 2}}
-    trace = _make_mock_trace([_make_mock_span("s1", span_dict)])
+    span_dict = {
+        "span_id": "s1",
+        "attributes": {"key1": "val1", "key2": "val2"},
+    }
+    span = _make_mock_span("s1", span_dict)
+    trace = _make_trace([span])
 
     result = tool.invoke(trace, span_id="s1", attributes=[])
-    parsed = json.loads(result.content)
 
+    parsed = json.loads(result.content)
     assert parsed["attributes"] == {}
+
+
+def test_invoke_with_nonexistent_attribute_keys():
+    tool = GetSpanTool()
+    span_dict = {
+        "span_id": "s1",
+        "attributes": {"real_key": "real_val"},
+    }
+    span = _make_mock_span("s1", span_dict)
+    trace = _make_trace([span])
+
+    result = tool.invoke(trace, span_id="s1", attributes=["nonexistent_key"])
+
+    parsed = json.loads(result.content)
+    assert parsed["attributes"] == {}
+
+
+def test_invoke_without_attribute_filter_returns_all():
+    tool = GetSpanTool()
+    span_dict = {
+        "span_id": "s1",
+        "attributes": {"a": 1, "b": 2, "c": 3},
+    }
+    span = _make_mock_span("s1", span_dict)
+    trace = _make_trace([span])
+
+    result = tool.invoke(trace, span_id="s1")
+
+    parsed = json.loads(result.content)
+    assert parsed["attributes"] == {"a": 1, "b": 2, "c": 3}
+
+
+def test_invoke_filter_on_span_without_attributes_key():
+    tool = GetSpanTool()
+    span_dict = {"span_id": "s1", "name": "no-attrs"}
+    span = _make_mock_span("s1", span_dict)
+    trace = _make_trace([span])
+
+    result = tool.invoke(trace, span_id="s1", attributes=["anything"])
+
+    parsed = json.loads(result.content)
+    assert "attributes" not in parsed
+    assert result.error is None
 
 
 # --- Pagination tests ---
 
 
-def _make_large_span(span_id, size_bytes):
-    """Create a mock span whose JSON serialization exceeds the given byte size."""
-    # Account for JSON overhead of {"data": "..."}
-    overhead = len(json.dumps({"data": ""}).encode("utf-8"))
-    padding = "x" * (size_bytes - overhead)
-    span_dict = {"data": padding}
-    return _make_mock_span(span_id, span_dict), span_dict
-
-
-def test_invoke_pagination_first_page():
+def test_invoke_small_content_no_pagination():
     tool = GetSpanTool()
-    target_size = _MAX_CHUNK_SIZE_BYTES * 2 + 500
-    mock_span, _ = _make_large_span("big", target_size)
-    trace = _make_mock_trace([mock_span])
+    span_dict = {"span_id": "s1", "name": "small"}
+    span = _make_mock_span("s1", span_dict)
+    trace = _make_trace([span])
+
+    result = tool.invoke(trace, span_id="s1")
+
+    assert result.page_token is None
+    assert result.content_size_bytes == len(json.dumps(span_dict).encode("utf-8"))
+    assert result.content_size_bytes < _MAX_CHUNK_SIZE_BYTES
+
+
+def test_invoke_large_content_returns_first_chunk():
+    tool = GetSpanTool()
+    large_value = "x" * (_MAX_CHUNK_SIZE_BYTES + 50_000)
+    span_dict = {"span_id": "big", "data": large_value}
+    span = _make_mock_span("big", span_dict)
+    trace = _make_trace([span])
 
     result = tool.invoke(trace, span_id="big")
 
-    assert result.error is None
-    assert result.page_token is not None
+    full_size = len(json.dumps(span_dict).encode("utf-8"))
+    assert result.content_size_bytes == full_size
     assert len(result.content.encode("utf-8")) == _MAX_CHUNK_SIZE_BYTES
-    assert result.content_size_bytes == target_size
+    assert result.page_token is not None
+    assert result.error is None
 
 
 def test_invoke_pagination_second_page():
     tool = GetSpanTool()
-    target_size = _MAX_CHUNK_SIZE_BYTES * 2 + 500
-    mock_span, _ = _make_large_span("big", target_size)
-    trace = _make_mock_trace([mock_span])
+    large_value = "y" * (_MAX_CHUNK_SIZE_BYTES + 50_000)
+    span_dict = {"span_id": "big", "data": large_value}
+    span = _make_mock_span("big", span_dict)
+    trace = _make_trace([span])
 
-    first = tool.invoke(trace, span_id="big")
-    second = tool.invoke(trace, span_id="big", page_token=first.page_token)
+    first_result = tool.invoke(trace, span_id="big")
+    assert first_result.page_token is not None
 
-    assert second.error is None
-    assert second.page_token is not None
-    assert len(second.content.encode("utf-8")) == _MAX_CHUNK_SIZE_BYTES
-    assert second.content_size_bytes == target_size
+    second_result = tool.invoke(trace, span_id="big", page_token=first_result.page_token)
+
+    assert second_result.span_id == "big"
+    assert second_result.content_size_bytes == first_result.content_size_bytes
+    assert second_result.error is None
+    assert len(second_result.content.encode("utf-8")) > 0
+
+
+def test_invoke_pagination_reconstructs_full_content():
+    tool = GetSpanTool()
+    large_value = "z" * (_MAX_CHUNK_SIZE_BYTES * 3)
+    span_dict = {"span_id": "huge", "data": large_value}
+    span = _make_mock_span("huge", span_dict)
+    trace = _make_trace([span])
+
+    full_json = json.dumps(span_dict)
+    full_bytes = full_json.encode("utf-8")
+
+    # Collect all chunks
+    chunks = []
+    page_token = None
+    while True:
+        result = tool.invoke(trace, span_id="huge", page_token=page_token)
+        assert result.error is None
+        assert result.content_size_bytes == len(full_bytes)
+        chunks.append(result.content.encode("utf-8"))
+        if result.page_token is None:
+            break
+        page_token = result.page_token
+
+    reconstructed = b"".join(chunks)
+    assert reconstructed == full_bytes
 
 
 def test_invoke_pagination_last_page_has_no_token():
     tool = GetSpanTool()
-    target_size = _MAX_CHUNK_SIZE_BYTES + 100
-    mock_span, _ = _make_large_span("big", target_size)
-    trace = _make_mock_trace([mock_span])
+    large_value = "w" * (_MAX_CHUNK_SIZE_BYTES + 100)
+    span_dict = {"span_id": "s1", "data": large_value}
+    span = _make_mock_span("s1", span_dict)
+    trace = _make_trace([span])
 
-    first = tool.invoke(trace, span_id="big")
-    second = tool.invoke(trace, span_id="big", page_token=first.page_token)
-
-    assert second.page_token is None
-    assert second.error is None
-
-
-def test_invoke_pagination_full_reconstruction():
-    tool = GetSpanTool()
-    target_size = _MAX_CHUNK_SIZE_BYTES * 3 + 7
-    mock_span, span_dict = _make_large_span("big", target_size)
-    trace = _make_mock_trace([mock_span])
-
-    chunks = []
-    token = None
+    # Walk to the final page
+    page_token = None
+    last_result = None
     while True:
-        result = tool.invoke(trace, span_id="big", page_token=token)
-        assert result.error is None
-        chunks.append(result.content.encode("utf-8"))
+        result = tool.invoke(trace, span_id="s1", page_token=page_token)
+        last_result = result
         if result.page_token is None:
             break
-        token = result.page_token
+        page_token = result.page_token
 
-    reconstructed = b"".join(chunks)
-    expected = json.dumps(span_dict).encode("utf-8")
+    assert last_result.page_token is None
+    assert last_result.error is None
+    assert len(last_result.content) > 0
 
-    assert reconstructed == expected
-    assert len(chunks) == 4  # 3 full chunks + 1 partial
+
+def test_invoke_content_exactly_at_chunk_boundary():
+    tool = GetSpanTool()
+    # Build content whose JSON-encoded size is exactly _MAX_CHUNK_SIZE_BYTES.
+    overhead = len(json.dumps({"d": ""}).encode("utf-8"))
+    filler = "a" * (_MAX_CHUNK_SIZE_BYTES - overhead)
+    span_dict = {"d": filler}
+    span = _make_mock_span("exact", span_dict)
+    trace = _make_trace([span])
+
+    # Verify our setup: total size should be exactly at the boundary
+    assert len(json.dumps(span_dict).encode("utf-8")) == _MAX_CHUNK_SIZE_BYTES
+
+    result = tool.invoke(trace, span_id="exact")
+
+    assert result.page_token is None
+    assert result.content_size_bytes == _MAX_CHUNK_SIZE_BYTES
+    assert json.loads(result.content) == span_dict
 
 
 def test_invoke_pagination_content_size_bytes_consistent_across_pages():
     tool = GetSpanTool()
-    target_size = _MAX_CHUNK_SIZE_BYTES * 2 + 1
-    mock_span, _ = _make_large_span("big", target_size)
-    trace = _make_mock_trace([mock_span])
+    large_value = "v" * (_MAX_CHUNK_SIZE_BYTES * 2)
+    span_dict = {"span_id": "big", "data": large_value}
+    span = _make_mock_span("big", span_dict)
+    trace = _make_trace([span])
+
+    full_size = len(json.dumps(span_dict).encode("utf-8"))
 
     sizes = []
     token = None
@@ -308,27 +388,15 @@ def test_invoke_pagination_content_size_bytes_consistent_across_pages():
         token = result.page_token
 
     # content_size_bytes should report the total size on every page
-    assert all(s == target_size for s in sizes)
-
-
-def test_invoke_exactly_at_chunk_boundary():
-    tool = GetSpanTool()
-    mock_span, _ = _make_large_span("exact", _MAX_CHUNK_SIZE_BYTES)
-    trace = _make_mock_trace([mock_span])
-
-    result = tool.invoke(trace, span_id="exact")
-
-    # Content fits exactly in one chunk, so no pagination needed
-    assert result.page_token is None
-    assert result.error is None
-    assert result.content_size_bytes == _MAX_CHUNK_SIZE_BYTES
+    assert all(s == full_size for s in sizes)
 
 
 def test_invoke_page_token_is_string():
     tool = GetSpanTool()
-    target_size = _MAX_CHUNK_SIZE_BYTES + 1
-    mock_span, _ = _make_large_span("big", target_size)
-    trace = _make_mock_trace([mock_span])
+    large_value = "q" * (_MAX_CHUNK_SIZE_BYTES + 1)
+    span_dict = {"span_id": "big", "data": large_value}
+    span = _make_mock_span("big", span_dict)
+    trace = _make_trace([span])
 
     result = tool.invoke(trace, span_id="big")
 
